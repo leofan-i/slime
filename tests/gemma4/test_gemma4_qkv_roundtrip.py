@@ -164,6 +164,38 @@ def test_global_k_eq_v_layer_qkv_roundtrip():
     )
 
 
+def test_global_qkv_pack_uses_hf_tensor_count_not_local_layer_name():
+    """Pipeline-parallel local layer names can still look like layer 0 while
+    the remapped HF tensors are from a global K=V layer. The bridge must infer
+    global QKV geometry from receiving [q, k], not from the local layer index.
+    """
+    cfg = SimpleNamespace(
+        hidden_size=6,
+        num_attention_heads=4,
+        head_dim=1,
+        num_key_value_heads=2,
+        global_head_dim=2,
+        num_global_key_value_heads=2,
+        num_hidden_layers=1,
+        attention_k_eq_v=True,
+        layer_types=["sliding_attention"],
+    )
+    bridge = _build_bridge_stub(cfg)
+    q = torch.arange(48, dtype=torch.float32).view(8, 6)
+    k = torch.arange(24, dtype=torch.float32).view(4, 6) + 1000
+
+    packed = bridge._weight_to_mcore_format(
+        "decoder.layers.0.self_attention.linear_qkv.weight",
+        [q, k],
+    )
+
+    expected = torch.cat(
+        [q.view(2, 4, 6), k.view(2, 2, 6), k.view(2, 2, 6)],
+        dim=1,
+    ).view(-1, 6)
+    assert torch.equal(packed, expected)
+
+
 def test_sliding_layer_roundtrip_rejects_wrong_shape():
     """The new shape assertions (B6/B8) fire when q_proj rows don't match
     num_kv_heads * group_dim — a common symptom of a miscounted config."""
