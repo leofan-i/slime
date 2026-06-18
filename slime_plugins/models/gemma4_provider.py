@@ -81,6 +81,37 @@ class DualRotaryEmbedding(torch.nn.Module):
         return torch.cat([global_emb, local_emb], dim=-1)
 
 
+class _Gemma4LogitSoftcap(torch.autograd.Function):
+    """Apply Gemma4 final logit softcapping without allocating new logits."""
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = scale
+        ctx.mark_dirty(logits)
+        logits.div_(scale)
+        logits.tanh_()
+        logits.mul_(scale)
+        ctx.save_for_backward(logits)
+        return logits
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (softcapped,) = ctx.saved_tensors
+        scale = ctx.scale
+        grad_logits = softcapped / scale
+        grad_logits.pow_(2)
+        grad_logits.neg_()
+        grad_logits.add_(1.0)
+        grad_logits.mul_(grad_output)
+        return grad_logits, None
+
+
+def _logit_softcapping(logits: torch.Tensor, scale: float) -> torch.Tensor:
+    if scale <= 0:
+        return logits
+    return _Gemma4LogitSoftcap.apply(logits, float(scale))
+
+
 def _install_hooks(model, args, config, pre_process, post_process):
     """Install Gemma4-specific pre/post-process hooks on a built GPTModel.
 
@@ -121,8 +152,8 @@ def _install_hooks(model, args, config, pre_process, post_process):
     if post_process and softcap and hasattr(inner, "output_layer"):
         def _softcap_hook(module, inp, output):
             if isinstance(output, tuple):
-                return (torch.tanh(output[0] / softcap) * softcap,) + output[1:]
-            return torch.tanh(output / softcap) * softcap
+                return (_logit_softcapping(output[0], softcap),) + output[1:]
+            return _logit_softcapping(output, softcap)
         inner.output_layer.register_forward_hook(_softcap_hook)
 
     # Dual RoPE: replace Megatron's single rotary_pos_emb with a wrapper that

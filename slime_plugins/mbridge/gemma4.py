@@ -144,6 +144,20 @@ class Gemma4Bridge(Gemma3Bridge):
         layer_types = getattr(hf_text, "layer_types", [])
         self._GLOBAL_ATTN_LAYERS = {i for i, t in enumerate(layer_types) if t == "full_attention"}
 
+    def _attention_shape_for_hf_weights(self, hf_weights: list[torch.Tensor]) -> tuple[int, int]:
+        hf_text = self.hf_config.text_config if hasattr(self.hf_config, "text_config") else self.hf_config
+        if len(hf_weights) == 2:
+            return (
+                int(getattr(hf_text, "num_global_key_value_heads", hf_text.num_key_value_heads)),
+                int(getattr(hf_text, "global_head_dim", hf_text.head_dim)),
+            )
+        if len(hf_weights) == 3:
+            return (
+                int(hf_text.num_key_value_heads),
+                int(getattr(hf_text, "head_dim", hf_text.hidden_size // hf_text.num_attention_heads)),
+            )
+        raise ValueError(f"Gemma4 linear_qkv expects 2 or 3 HF tensors, got {len(hf_weights)}.")
+
     def _weight_name_mapping_attention(self, name: str) -> list[str]:
         split_name = name.split(".")
         layer_number = int(split_name[2])
@@ -231,29 +245,19 @@ class Gemma4Bridge(Gemma3Bridge):
         ):
             m = re.search(r"layers\.(\d+)\.", mcore_weights_name)
             layer_num = int(m.group(1)) if m else -1
-            is_global = layer_num in self._GLOBAL_ATTN_LAYERS
 
             hf_text = self.hf_config.text_config if hasattr(self.hf_config, "text_config") else self.hf_config
             num_attention_heads = hf_text.num_attention_heads
-            if is_global:
-                head_dim = hf_text.global_head_dim
-                num_kv_heads = hf_text.num_global_key_value_heads
-            else:
-                head_dim = hf_text.head_dim
-                num_kv_heads = hf_text.num_key_value_heads
+            num_kv_heads, head_dim = self._attention_shape_for_hf_weights(hf_weights)
 
             # For K=V global layers the HF checkpoint ships `[q, k]` (no
             # v_proj); reconstruct V by duplicating K so the Mcore linear_qkv
             # weight has the standard `[q, k, v]` layout with v_proj == k_proj.
             if len(hf_weights) == 2:
-                assert is_global and getattr(hf_text, "attention_k_eq_v", True), (
-                    f"layer {layer_num}: got 2 HF weights ([q, k]) but this is "
-                    f"not a K=V global layer (is_global={is_global}, "
-                    f"attention_k_eq_v="
-                    f"{getattr(hf_text, 'attention_k_eq_v', None)})"
-                )
                 q, k = hf_weights
                 hf_weights = [q, k, k.clone()]
+            elif len(hf_weights) != 3:
+                raise ValueError(f"Gemma4 linear_qkv expects 2 or 3 HF tensors, got {len(hf_weights)}.")
 
             q, k, v = hf_weights
             group_dim = head_dim * num_attention_heads // num_kv_heads

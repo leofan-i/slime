@@ -87,6 +87,48 @@ def test_install_hooks_softcap_wraps_tensor_output():
     assert hooked.abs().max().item() <= 30.0
 
 
+def test_install_hooks_softcap_reuses_storage_with_correct_gradient():
+    class _CaptureOutput(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.raw = None
+            self.raw_before = None
+
+        def forward(self, x):
+            self.raw = x * 1.0
+            self.raw_before = self.raw.detach().clone()
+            return self.raw
+
+    inner = torch.nn.Module()
+    inner.output_layer = _CaptureOutput()
+
+    hf_text = SimpleNamespace(final_logit_softcapping=30.0)
+    orig = _provider._load_hf_text_config
+    _provider._load_hf_text_config = lambda _path: hf_text
+    try:
+        args = SimpleNamespace(hf_checkpoint="/nonexistent")
+        config = SimpleNamespace(hidden_size=4)
+        _provider._install_hooks(
+            model=inner, args=args, config=config,
+            pre_process=False, post_process=True,
+        )
+    finally:
+        _provider._load_hf_text_config = orig
+
+    base = torch.linspace(-3.0, 3.0, steps=12, dtype=torch.float64).view(3, 4)
+    base.requires_grad_(True)
+    weights = torch.linspace(0.1, 1.2, steps=12, dtype=torch.float64).view(3, 4)
+
+    hooked = inner.output_layer(base)
+    (hooked * weights).sum().backward()
+
+    expected = 30.0 * torch.tanh(inner.output_layer.raw_before / 30.0)
+    expected_grad = weights * (1.0 - torch.tanh(inner.output_layer.raw_before / 30.0).pow(2))
+    assert hooked.data_ptr() == inner.output_layer.raw.data_ptr()
+    assert torch.allclose(hooked, expected)
+    assert torch.allclose(base.grad, expected_grad)
+
+
 def test_install_hooks_softcap_wraps_tuple_output():
     """Some Megatron layers return (output, bias) tuples. The softcap hook
     must only transform the first element and leave the rest untouched."""

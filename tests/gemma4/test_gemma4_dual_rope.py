@@ -63,8 +63,10 @@ class _FakeRope:
     def __init__(self, dim: int, tag: float):
         self.dim = dim
         self.tag = tag
+        self.calls = []
 
     def __call__(self, seq_len, **kwargs):
+        self.calls.append((seq_len, kwargs))
         # Shape [seq_len, 1, 1, dim] — same layout Megatron produces.
         # Value: seq-index * 100 + dim-index, plus a per-rope tag so we can
         # tell global from local apart slice-by-slice.
@@ -137,6 +139,19 @@ def test_dual_rope_delegates_get_rotary_seq_len_to_local():
     assert result[0] == "fake_seq_len_result"
     assert result[1] == ("a",)
     assert result[2] == {"b": 2}
+
+
+def test_dual_rope_forwards_packed_seq_params_to_both_ropes():
+    local = _FakeRope(dim=4, tag=0.0)
+    glob = _FakeRope(dim=8, tag=0.0)
+    dual = DualRotaryEmbedding(local, glob, global_dim=8)
+    packed_seq_params = object()
+
+    combined = dual(12, offset=3, packed_seq_params=packed_seq_params)
+
+    assert combined.shape == (12, 1, 1, 12)
+    assert glob.calls == [(12, {"offset": 3, "packed_seq_params": packed_seq_params})]
+    assert local.calls == [(12, {"offset": 3, "packed_seq_params": packed_seq_params})]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Megatron RotaryEmbedding.forward requires CUDA")
